@@ -145,6 +145,29 @@ namespace Sharp7.Tests
             bytes.ShouldBe(new byte[] {3, 4, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11});
         }
 
+        //ReadWriteTmAsync
+        [Fact]
+        public async void ReadWriteTmAsync()
+        {
+            var bytes = new byte[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+            var index = 5;
+            Server.RegisterArea(S7Server.SrvAreaTm, index, ref bytes, bytes.Length / 2);
+
+            var buffer = new ushort[2];
+            var rc = await Client.TMReadAsync(0, 2, buffer);
+
+            //test read
+            rc.Error.ShouldBe(Sharp7.S7Consts.ResultOK);
+            buffer.ShouldBe(new ushort[] { 0x0100, 0x0302 });
+
+            buffer = new ushort[] { 0x0403, 0x0201 };
+            rc = await Client.TMWriteAsync(0, 2, buffer);
+
+            //test write
+            rc.Error.ShouldBe(Sharp7.S7Consts.ResultOK);
+            bytes.ShouldBe(new byte[] { 3, 4, 1, 2, 4, 5, 6, 7, 8, 9 });
+        }
+
         [Fact]
         public void ReadWriteEb()
         {

@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 
 namespace Sharp7
 {
@@ -519,6 +520,22 @@ namespace Sharp7
 			}
 			return _LastError;
 		}
+
+		private async Task<int> TCPConnectAsync()
+        {
+            if (_LastError == 0)
+            {
+                try
+                {
+                    await Socket.ConnectAsync(IPAddress, _PLCPort);
+                }
+                catch
+                {
+                    _LastError = S7Consts.errTCPConnectionFailed;
+                }
+            }
+            return _LastError;
+        }
        
 		private void RecvPacket(byte[] Buffer, int Start, int Size)
 		{
@@ -528,7 +545,15 @@ namespace Sharp7
 				_LastError = S7Consts.errTCPNotConnected;
 		}
 
-		private void SendPacket(byte[] Buffer, int Len)
+        private async Task RecvPacketAsync(byte[] Buffer, int Start, int Size)
+        {
+            if (Connected)
+                _LastError = await Socket.ReceiveAsync(Buffer, Start, Size);
+            else
+                _LastError = S7Consts.errTCPNotConnected;
+        }
+
+        private void SendPacket(byte[] Buffer, int Len)
 		{
 			if (Connected)
 				_LastError = Socket.Send(Buffer, Len);
@@ -536,12 +561,24 @@ namespace Sharp7
 				_LastError = S7Consts.errTCPNotConnected;
 		}
 
-		private void SendPacket(byte[] Buffer)
+        private async Task SendPacketAsync(byte[] Buffer, int Len)
+        {
+            if (Connected)
+                _LastError = await Socket.SendAsync(Buffer, Len);
+            else
+                _LastError = S7Consts.errTCPNotConnected;
+        }
+        private void SendPacket(byte[] Buffer)
 		{
 			SendPacket(Buffer, Buffer.Length);
 		}
 
-		private int RecvIsoPacket()
+        private async Task SendPacketAsync(byte[] Buffer)
+        {
+            await SendPacketAsync(Buffer, Buffer.Length);
+        }
+
+        private int RecvIsoPacket()
 		{
 			Boolean Done = false;
 			int Size = 0;
@@ -580,6 +617,45 @@ namespace Sharp7
 			return 0;
 		}
 
+		private async Task<int> RecvIsoPacketAsync()
+        {
+            Boolean Done = false;
+            int Size = 0;
+            while ((_LastError == 0) && !Done)
+            {
+                // Get TPKT (4 bytes)
+                await RecvPacketAsync(PDU, 0, 4);
+                if (_LastError == 0)
+                {
+                    Size = PDU.GetWordAt(2);
+                    // Check 0 bytes Data Packet (only TPKT+COTP = 7 bytes)
+                    if (Size == IsoHSize)
+                        await RecvPacketAsync(PDU, 4, 3); // Skip remaining 3 bytes and Done is still false
+                    else
+                    {
+                        if ((Size > _PduSizeRequested + IsoHSize) || (Size < MinPduSize))
+                            _LastError = S7Consts.errIsoInvalidPDU;
+                        else
+                            Done = true; // a valid Length !=7 && >16 && <247
+                    }
+                }
+            }
+            if (_LastError == 0)
+            {
+                await RecvPacketAsync(PDU, 4, 3); // Skip remaining 3 COTP bytes
+                LastPDUType = PDU[5];   // Stores PDU Type, we need it 
+                // Receives the S7 Payload          
+                await RecvPacketAsync(PDU, 7, Size - IsoHSize);
+            }
+
+            if (_LastError == 0)
+            {
+                return Size;
+            }
+
+            return 0;
+        }
+
 		private int ISOConnect()
 		{
 			int Size;
@@ -608,6 +684,34 @@ namespace Sharp7
 			return _LastError;
 		}
 
+		private async Task<int> ISOConnectAsync()
+        {
+            int Size;
+            ISO_CR[16] = LocalTSAP_HI;
+            ISO_CR[17] = LocalTSAP_LO;
+            ISO_CR[20] = RemoteTSAP_HI;
+            ISO_CR[21] = RemoteTSAP_LO;
+
+            // Sends the connection request telegram      
+            await SendPacketAsync(ISO_CR);
+            if (_LastError == 0)
+            {
+                // Gets the reply (if any)
+                Size = await RecvIsoPacketAsync();
+                if (_LastError == 0)
+                {
+                    if (Size == 22)
+                    {
+                        if (LastPDUType != (byte)0xD0) // 0xD0 = CC Connection confirm
+                            _LastError = S7Consts.errIsoConnect;
+                    }
+                    else
+                        _LastError = S7Consts.errIsoInvalidPDU;
+                }
+            }
+            return _LastError;
+        }
+
 		private int NegotiatePduLength()
 		{
 			int Length;
@@ -634,6 +738,33 @@ namespace Sharp7
 			}
 			return _LastError;
 		}
+
+		private async Task<int> NegotiatePduLengthAsync()
+        {
+            int Length;
+            // Set PDU Size Requested
+            S7_PN.SetWordAt(23, (ushort)_PduSizeRequested);
+            // Sends the connection request telegram
+            await SendPacketAsync(S7_PN);
+            if (_LastError == 0)
+            {
+                Length = await RecvIsoPacketAsync();
+                if (_LastError == 0)
+                {
+                    // check S7 Error
+                    if ((Length == 27) && (PDU[17] == 0) && (PDU[18] == 0))  // 20 = size of Negotiate Answer
+                    {
+                        // Get PDU Size Negotiated
+                        _PDULength = PDU.GetWordAt(25);
+                        if (_PDULength <= 0)
+                            _LastError = S7Consts.errCliNegotiatingPDU;
+                    }
+                    else
+                        _LastError = S7Consts.errCliNegotiatingPDU;
+                }
+            }
+            return _LastError;
+        }
 
 		private int CpuError(ushort Error)
 		{
@@ -708,12 +839,44 @@ namespace Sharp7
 			return _LastError;
 		}
 
+		public async Task<int> ConnectAsync()
+        {
+            _LastError = 0;
+            Time_ms = 0;
+            int Elapsed = Environment.TickCount;
+            if (!Connected)
+            {
+                await TCPConnectAsync(); // First stage : TCP Connection
+                if (_LastError == 0)
+                {
+                    await ISOConnectAsync(); // Second stage : ISOTCP (ISO 8073) Connection
+                    if (_LastError == 0)
+                    {
+                        _LastError = await NegotiatePduLengthAsync(); // Third stage : S7 PDU negotiation
+                    }
+                }
+            }
+            if (_LastError != 0)
+                Disconnect();
+            else
+                Time_ms = Environment.TickCount - Elapsed;
+
+            return _LastError;
+        }
+
 		public int ConnectTo(string Address, int Rack, int Slot)
 		{
 			UInt16 RemoteTSAP = (UInt16)((ConnType << 8) + (Rack * 0x20) + Slot);
 			SetConnectionParams(Address, 0x0100, RemoteTSAP);
 			return Connect();
 		}
+
+		public async Task<int> ConnectToAsync(string Address, int Rack, int Slot)
+        {
+            UInt16 RemoteTSAP = (UInt16)((ConnType << 8) + (Rack * 0x20) + Slot);
+            SetConnectionParams(Address, 0x0100, RemoteTSAP);
+            return await ConnectAsync();
+        }
 
 		public int SetConnectionParams(string Address, ushort LocalTSAP, ushort RemoteTSAP)
 		{
@@ -1205,7 +1368,106 @@ namespace Sharp7
 			return _LastError;
 		}
 
-		public int WriteMultiVars(S7DataItem[] Items, int ItemsCount)
+        public async Task<int> ReadMultiVarsAsync(S7DataItem[] Items, int ItemsCount)
+        {
+            int Offset;
+            int Length;
+            int ItemSize;
+            byte[] S7Item = new byte[12];
+            byte[] S7ItemRead = new byte[1024];
+
+            _LastError = 0;
+            Time_ms = 0;
+            int Elapsed = Environment.TickCount;
+
+            // Checks items
+            if (ItemsCount > MaxVars)
+                return S7Consts.errCliTooManyItems;
+
+            // Fills Header
+            Array.Copy(S7_MRD_HEADER, 0, PDU, 0, S7_MRD_HEADER.Length);
+            PDU.SetWordAt(13, (ushort)(ItemsCount * S7Item.Length + 2));
+            PDU[18] = (byte)ItemsCount;
+            // Fills the Items
+            Offset = 19;
+            for (int c = 0; c < ItemsCount; c++)
+            {
+                Array.Copy(S7_MRD_ITEM, S7Item, S7Item.Length);
+                S7Item[3] = (byte)Items[c].WordLen;
+                S7Item.SetWordAt(4, (ushort)Items[c].Amount);
+                if (Items[c].Area == (int)S7Area.DB)
+                    S7Item.SetWordAt(6, (ushort)Items[c].DBNumber);
+                S7Item[8] = (byte)Items[c].Area;
+
+                // Address into the PLC
+                int Address = Items[c].Start;
+                S7Item[11] = (byte)(Address & 0x0FF);
+                Address = Address >> 8;
+                S7Item[10] = (byte)(Address & 0x0FF);
+                Address = Address >> 8;
+                S7Item[09] = (byte)(Address & 0x0FF);
+
+                Array.Copy(S7Item, 0, PDU, Offset, S7Item.Length);
+                Offset += S7Item.Length;
+            }
+
+            if (Offset > _PDULength)
+                return S7Consts.errCliSizeOverPDU;
+
+            PDU.SetWordAt(2, (ushort)Offset); // Whole size
+            await SendPacketAsync(PDU, Offset);
+
+            if (_LastError != 0)
+                return _LastError;
+            // Get Answer
+            Length = await RecvIsoPacketAsync();
+            if (_LastError != 0)
+                return _LastError;
+            // Check ISO Length
+            if (Length < 22)
+            {
+                _LastError = S7Consts.errIsoInvalidPDU; // PDU too Small
+                return _LastError;
+            }
+            // Check Global Operation Result
+            _LastError = CpuError(PDU.GetWordAt(17));
+            if (_LastError != 0)
+                return _LastError;
+            // Get true ItemsCount
+            int ItemsRead = PDU.GetByteAt(20);
+            if ((ItemsRead != ItemsCount) || (ItemsRead > MaxVars))
+            {
+                _LastError = S7Consts.errCliInvalidPlcAnswer;
+                return _LastError;
+            }
+            // Get Data
+            Offset = 21;
+            for (int c = 0; c < ItemsCount; c++)
+            {
+                // Get the Item
+                Array.Copy(PDU, Offset, S7ItemRead, 0, Length - Offset);
+                if (S7ItemRead[0] == 0xff)
+                {
+                    ItemSize = (int)S7ItemRead.GetWordAt(2);
+                    if ((S7ItemRead[1] != TS_ResOctet) && (S7ItemRead[1] != TS_ResReal) && (S7ItemRead[1] != TS_ResBit))
+                        ItemSize = ItemSize >> 3;
+                    Marshal.Copy(S7ItemRead, 4, Items[c].pData, ItemSize);
+                    Items[c].Result = 0;
+                    if (ItemSize % 2 != 0)
+                        ItemSize++; // Odd sizes are rounded
+                    Offset = Offset + 4 + ItemSize;
+                }
+                else
+                {
+                    Items[c].Result = CpuError(S7ItemRead[0]);
+                    Offset += 4; // Skip the Item header
+                }
+            }
+            Time_ms = Environment.TickCount - Elapsed;
+            return _LastError;
+        }
+
+        public int WriteMultiVars(S7DataItem[] Items, int ItemsCount)
 		{
 			int Offset;
 			int ParLength;
@@ -1319,11 +1581,125 @@ namespace Sharp7
 			return _LastError;
 		}
 
-		#endregion
+        public async Task<int> WriteMultiVarsAsync(S7DataItem[] Items, int ItemsCount)
+        {
+            int Offset;
+            int ParLength;
+            int DataLength;
+            int ItemDataSize;
+            byte[] S7ParItem = new byte[S7_MWR_PARAM.Length];
+            byte[] S7DataItem = new byte[1024];
 
-		#region [Data I/O lean functions]
+            _LastError = 0;
+            Time_ms = 0;
+            int Elapsed = Environment.TickCount;
 
-		public int DBRead(int DBNumber, int Start, int Size, byte[] Buffer)
+            // Checks items
+            if (ItemsCount > MaxVars)
+                return S7Consts.errCliTooManyItems;
+            // Fills Header
+            Array.Copy(S7_MWR_HEADER, 0, PDU, 0, S7_MWR_HEADER.Length);
+            ParLength = ItemsCount * S7_MWR_PARAM.Length + 2;
+            PDU.SetWordAt(13, (ushort)ParLength);
+            PDU[18] = (byte)ItemsCount;
+            // Fills Params
+            Offset = S7_MWR_HEADER.Length;
+            for (int c = 0; c < ItemsCount; c++)
+            {
+                Array.Copy(S7_MWR_PARAM, 0, S7ParItem, 0, S7_MWR_PARAM.Length);
+                S7ParItem[3] = (byte)Items[c].WordLen;
+                S7ParItem[8] = (byte)Items[c].Area;
+                S7ParItem.SetWordAt(4, (ushort)Items[c].Amount);
+                S7ParItem.SetWordAt(6, (ushort)Items[c].DBNumber);
+                // Address into the PLC
+                int Address = Items[c].Start;
+                S7ParItem[11] = (byte)(Address & 0x0FF);
+                Address = Address >> 8;
+                S7ParItem[10] = (byte)(Address & 0x0FF);
+                Address = Address >> 8;
+                S7ParItem[09] = (byte)(Address & 0x0FF);
+                Array.Copy(S7ParItem, 0, PDU, Offset, S7ParItem.Length);
+                Offset += S7_MWR_PARAM.Length;
+            }
+            // Fills Data
+            DataLength = 0;
+            for (int c = 0; c < ItemsCount; c++)
+            {
+                S7DataItem[0] = 0x00;
+                switch (Items[c].WordLen)
+                {
+                    case (int)S7WordLength.Bit:
+                        S7DataItem[1] = TS_ResBit;
+                        break;
+                    case (int)S7WordLength.Counter:
+                    case (int)S7WordLength.Timer:
+                        S7DataItem[1] = TS_ResOctet;
+                        break;
+                    default:
+                        S7DataItem[1] = TS_ResByte; // byte/word/dword etc.
+                        break;
+                };
+                if ((Items[c].WordLen == (int)S7WordLength.Timer) || (Items[c].WordLen == (int)S7WordLength.Counter))
+                    ItemDataSize = Items[c].Amount * 2;
+                else
+                    ItemDataSize = Items[c].Amount;
+
+                if ((S7DataItem[1] != TS_ResOctet) && (S7DataItem[1] != TS_ResBit))
+                    S7DataItem.SetWordAt(2, (ushort)(ItemDataSize * 8));
+                else
+                    S7DataItem.SetWordAt(2, (ushort)ItemDataSize);
+
+                Marshal.Copy(Items[c].pData, S7DataItem, 4, ItemDataSize);
+                if (ItemDataSize % 2 != 0)
+                {
+                    S7DataItem[ItemDataSize + 4] = 0x00;
+                    ItemDataSize++;
+                }
+                Array.Copy(S7DataItem, 0, PDU, Offset, ItemDataSize + 4);
+                Offset = Offset + ItemDataSize + 4;
+                DataLength = DataLength + ItemDataSize + 4;
+            }
+
+            // Checks the size
+            if (Offset > _PDULength)
+                return S7Consts.errCliSizeOverPDU;
+
+            PDU.SetWordAt(2, (ushort)Offset); // Whole size
+            PDU.SetWordAt(15, (ushort)DataLength); // Whole size
+            await SendPacketAsync(PDU, Offset);
+
+            await RecvIsoPacketAsync();
+            if (_LastError == 0)
+            {
+                // Check Global Operation Result
+                _LastError = CpuError(PDU.GetWordAt(17));
+                if (_LastError != 0)
+                    return _LastError;
+                // Get true ItemsCount
+                int ItemsWritten = PDU.GetByteAt(20);
+                if ((ItemsWritten != ItemsCount) || (ItemsWritten > MaxVars))
+                {
+                    _LastError = S7Consts.errCliInvalidPlcAnswer;
+                    return _LastError;
+                }
+
+                for (int c = 0; c < ItemsCount; c++)
+                {
+                    if (PDU[c + 21] == 0xFF)
+                        Items[c].Result = 0;
+                    else
+                        Items[c].Result = CpuError((ushort)PDU[c + 21]);
+                }
+                Time_ms = Environment.TickCount - Elapsed;
+            }
+            return _LastError;
+        }
+
+        #endregion
+
+        #region [Data I/O lean functions]
+
+        public int DBRead(int DBNumber, int Start, int Size, byte[] Buffer)
 		{
 			return ReadArea(S7Area.DB, DBNumber, Start, Size, S7WordLength.Byte, Buffer);
 		}
@@ -1486,10 +1862,72 @@ namespace Sharp7
 				Time_ms = Environment.TickCount - Elapsed;
 
 			return _LastError;
-            
 		}
 
-		public int GetPgBlockInfo(ref S7BlockInfo Info, byte[] Buffer, int Size)
+        public async Task<(int Error, S7BlockInfo Info)> GetAgBlockInfoAsync(int BlockType, int BlockNum, S7BlockInfo Info)
+        {
+            _LastError = 0;
+            Time_ms = 0;
+            int Elapsed = Environment.TickCount;
+
+            S7_BI[30] = (byte)BlockType;
+            // Block Number
+            S7_BI[31] = (byte)((BlockNum / 10000) + 0x30);
+            BlockNum = BlockNum % 10000;
+            S7_BI[32] = (byte)((BlockNum / 1000) + 0x30);
+            BlockNum = BlockNum % 1000;
+            S7_BI[33] = (byte)((BlockNum / 100) + 0x30);
+            BlockNum = BlockNum % 100;
+            S7_BI[34] = (byte)((BlockNum / 10) + 0x30);
+            BlockNum = BlockNum % 10;
+            S7_BI[35] = (byte)((BlockNum / 1) + 0x30);
+
+            await SendPacketAsync(S7_BI);
+
+            if (_LastError == 0)
+            {
+                int Length = await RecvIsoPacketAsync();
+                if (Length > 32) // the minimum expected
+                {
+                    ushort Result = PDU.GetWordAt(27);
+                    if (Result == 0)
+                    {
+                        Info.BlkFlags = PDU[42];
+                        Info.BlkLang = PDU[43];
+                        Info.BlkType = PDU[44];
+                        Info.BlkNumber = PDU.GetWordAt(45);
+                        Info.LoadSize = PDU.GetDIntAt(47);
+                        Info.CodeDate = SiemensTimestamp(PDU.GetWordAt(59));
+                        Info.IntfDate = SiemensTimestamp(PDU.GetWordAt(65));
+                        Info.SBBLength = PDU.GetWordAt(67);
+                        Info.LocalData = PDU.GetWordAt(71);
+                        Info.MC7Size = PDU.GetWordAt(73);
+                        Info.Author = PDU.GetCharsAt(75, 8).Trim(new char[] { (char)0 });
+                        Info.Family = PDU.GetCharsAt(83, 8).Trim(new char[] { (char)0 });
+                        Info.Header = PDU.GetCharsAt(91, 8).Trim(new char[] { (char)0 });
+                        Info.Version = PDU[99];
+                        Info.CheckSum = PDU.GetWordAt(101);
+                    }
+                    else
+                    {
+                        _LastError = CpuError(Result);
+                    }
+                }
+                else
+                {
+                    _LastError = S7Consts.errIsoInvalidPDU;
+                }
+            }
+            if (_LastError == 0)
+            {
+                Time_ms = Environment.TickCount - Elapsed;
+            }
+
+            return (_LastError, Info);
+        }
+
+
+        public int GetPgBlockInfo(ref S7BlockInfo Info, byte[] Buffer, int Size)
 		{
 			return S7Consts.errCliFunctionNotImplemented;
 		}
@@ -2046,106 +2484,487 @@ namespace Sharp7
 			return _LastError;
 		}
 
-		#endregion
+        #endregion
 
-		#region [Async functions (not implemented)]
+        #region [Async functions]
 
-		public int AsReadArea(int Area, int DBNumber, int Start, int Amount, int WordLen, byte[] Buffer)
+        public async Task<(int Error, int BytesRead)> ReadAreaAsync(S7Area Area, int DBNumber, int Start, int Amount, S7WordLength WordLen, byte[] Buffer)
+        {
+            return await ReadAreaAsync((int)Area, DBNumber, Start, Amount, (int)WordLen, Buffer);
+        }
+
+        public async Task<(int Error, int BytesRead)> ReadAreaAsync(int Area, int DBNumber, int Start, int Amount, int WordLen, byte[] Buffer)
+		{
+			int BytesRead = 0;
+			return await ReadAreaAsync(Area, DBNumber, Start, Amount, WordLen, Buffer, BytesRead);
+		}
+
+        public async Task<(int Error, int BytesRead)> ReadAreaAsync(int Area, int DBNumber, int Start, int Amount, int WordLen, byte[] Buffer, int BytesRead)
+        {
+            int Address;
+            int NumElements;
+            int MaxElements;
+            int TotElements;
+            int SizeRequested;
+            int Length;
+            int Offset = 0;
+            int WordSize = 1;
+
+            _LastError = 0;
+            Time_ms = 0;
+            int Elapsed = Environment.TickCount;
+
+            // Some adjustment
+            if (Area == (int)S7Area.CT)
+                WordLen = (int)S7WordLength.Counter;
+            if (Area == (int)S7Area.TM)
+                WordLen = (int)S7WordLength.Timer;
+
+            // Calc Word size          
+            WordSize = WordLen.DataSizeByte();
+            if (WordSize == 0)
+                return (S7Consts.errCliInvalidWordLen, 0);
+
+            if (WordLen == (int)S7WordLength.Bit)
+                Amount = 1;  // Only 1 bit can be transferred at a time
+            else
+            {
+                if ((WordLen != (int)S7WordLength.Counter) && (WordLen != (int)S7WordLength.Timer))
+                {
+                    Amount = Amount * WordSize;
+                    WordSize = 1;
+                    WordLen = (int)S7WordLength.Byte;
+                }
+            }
+
+            MaxElements = (_PDULength - 18) / WordSize; // 18 = Reply telegram header
+            TotElements = Amount;
+
+            while ((TotElements > 0) && (_LastError == 0))
+            {
+                NumElements = TotElements;
+                if (NumElements > MaxElements)
+                    NumElements = MaxElements;
+
+                SizeRequested = NumElements * WordSize;
+
+                // Setup the telegram
+                Array.Copy(S7_RW, 0, PDU, 0, Size_RD);
+                // Set DB Number
+                PDU[27] = (byte)Area;
+                // Set Area
+                if (Area == (int)S7Area.DB)
+                    PDU.SetWordAt(25, (ushort)DBNumber);
+
+                // Adjusts Start and word length
+                if ((WordLen == (int)S7WordLength.Bit) || (WordLen == (int)S7WordLength.Counter) || (WordLen == (int)S7WordLength.Timer))
+                {
+                    Address = Start;
+                    PDU[22] = (byte)WordLen;
+                }
+                else
+                    Address = Start << 3;
+
+                // Num elements
+                PDU.SetWordAt(23, (ushort)NumElements);
+
+                // Address into the PLC (only 3 bytes)           
+                PDU[30] = (byte)(Address & 0x0FF);
+                Address = Address >> 8;
+                PDU[29] = (byte)(Address & 0x0FF);
+                Address = Address >> 8;
+                PDU[28] = (byte)(Address & 0x0FF);
+
+                await SendPacketAsync(PDU, Size_RD);
+                if (_LastError == 0)
+                {
+                    Length = await RecvIsoPacketAsync();
+                    if (_LastError == 0)
+                    {
+                        if (Length < 25)
+                            _LastError = S7Consts.errIsoInvalidDataSize;
+                        else
+                        {
+                            if (PDU[21] != 0xFF)
+                                _LastError = CpuError(PDU[21]);
+                            else
+                            {
+                                Array.Copy(PDU, 25, Buffer, Offset, SizeRequested);
+                                Offset += SizeRequested;
+                            }
+                        }
+                    }
+                }
+                TotElements -= NumElements;
+                Start += NumElements * WordSize;
+            }
+
+            if (_LastError == 0)
+            {
+                BytesRead = Offset;
+                Time_ms = Environment.TickCount - Elapsed;
+            }
+            else
+                BytesRead = 0;
+
+            return (_LastError, BytesRead);
+        }
+
+        public async Task<(int Error, int BytesRead)> WriteAreaAsync(S7Area Area, int DBNumber, int Start, int Amount, S7WordLength WordLen, byte[] Buffer)
+        {
+            int BytesWritten = 0;
+            return await WriteAreaAsync((int)Area, DBNumber, Start, Amount, (int)WordLen, Buffer, BytesWritten);
+        }
+
+        public async Task<(int Error, int BytesRead)> WriteAreaAsync(int Area, int DBNumber, int Start, int Amount, int WordLen, byte[] Buffer)
+		{
+			int BytesWritten = 0;
+			return await WriteAreaAsync(Area, DBNumber, Start, Amount, WordLen, Buffer, BytesWritten);
+		}
+
+        public async Task<(int Error, int BytesWritten)> WriteAreaAsync(int Area, int DBNumber, int Start, int Amount, int WordLen, byte[] Buffer, int BytesWritten)
+        {
+            int Address;
+            int NumElements;
+            int MaxElements;
+            int TotElements;
+            int DataSize;
+            int IsoSize;
+            int Length;
+            int Offset = 0;
+            int WordSize = 1;
+
+            _LastError = 0;
+            Time_ms = 0;
+            int Elapsed = Environment.TickCount;
+
+            // Some adjustment
+            if (Area == (int)S7Area.CT)
+                WordLen = (int)S7WordLength.Counter;
+            if (Area == (int)S7Area.TM)
+                WordLen = (int)S7WordLength.Timer;
+
+            // Calc Word size          
+            WordSize = WordLen.DataSizeByte();
+            if (WordSize == 0)
+                return (S7Consts.errCliInvalidWordLen, 0);
+
+            if (WordLen == (int)S7WordLength.Bit) // Only 1 bit can be transferred at a time
+                Amount = 1;
+            else
+            {
+                if ((WordLen != (int)S7WordLength.Counter) && (WordLen != (int)S7WordLength.Timer))
+                {
+                    Amount = Amount * WordSize;
+                    WordSize = 1;
+                    WordLen = (int)S7WordLength.Byte;
+                }
+            }
+
+            MaxElements = (_PDULength - 35) / WordSize; // 35 = Reply telegram header
+            TotElements = Amount;
+
+            while ((TotElements > 0) && (_LastError == 0))
+            {
+                NumElements = TotElements;
+                if (NumElements > MaxElements)
+                    NumElements = MaxElements;
+
+                DataSize = NumElements * WordSize;
+                IsoSize = Size_WR + DataSize;
+
+                // Setup the telegram
+                Array.Copy(S7_RW, 0, PDU, 0, Size_WR);
+                // Whole telegram Size
+                PDU.SetWordAt(2, (ushort)IsoSize);
+                // Data Length
+                Length = DataSize + 4;
+                PDU.SetWordAt(15, (ushort)Length);
+                // Function
+                PDU[17] = (byte)0x05;
+                // Set DB Number
+                PDU[27] = (byte)Area;
+                if (Area == (int)S7Area.DB)
+                    PDU.SetWordAt(25, (ushort)DBNumber);
+
+                // Adjusts Start and word length
+                if ((WordLen == (int)S7WordLength.Bit) || (WordLen == (int)S7WordLength.Counter) || (WordLen == (int)S7WordLength.Timer))
+                {
+                    Address = Start;
+                    Length = DataSize;
+                    PDU[22] = (byte)WordLen;
+                }
+                else
+                {
+                    Address = Start << 3;
+                    Length = DataSize << 3;
+                }
+
+                // Num elements
+                PDU.SetWordAt(23, (ushort)NumElements);
+                // Address into the PLC
+                PDU[30] = (byte)(Address & 0x0FF);
+                Address = Address >> 8;
+                PDU[29] = (byte)(Address & 0x0FF);
+                Address = Address >> 8;
+                PDU[28] = (byte)(Address & 0x0FF);
+
+                // Transport Size
+                switch (WordLen)
+                {
+                    case (int)S7WordLength.Bit:
+                        PDU[32] = TS_ResBit;
+                        break;
+                    case (int)S7WordLength.Counter:
+                    case (int)S7WordLength.Timer:
+                        PDU[32] = TS_ResOctet;
+                        break;
+                    default:
+                        PDU[32] = TS_ResByte; // byte/word/dword etc.
+                        break;
+                };
+                // Length
+                PDU.SetWordAt(33, (ushort)Length);
+
+                // Copies the Data
+                Array.Copy(Buffer, Offset, PDU, 35, DataSize);
+
+                await SendPacketAsync(PDU, IsoSize);
+                if (_LastError == 0)
+                {
+                    Length = await RecvIsoPacketAsync();
+                    if (_LastError == 0)
+                    {
+                        if (Length == 22)
+                        {
+                            if (PDU[21] != (byte)0xFF)
+                                _LastError = CpuError(PDU[21]);
+                        }
+                        else
+                            _LastError = S7Consts.errIsoInvalidPDU;
+                    }
+                }
+                Offset += DataSize;
+                TotElements -= NumElements;
+                Start += NumElements * WordSize;
+            }
+
+            if (_LastError == 0)
+            {
+                BytesWritten = Offset;
+                Time_ms = Environment.TickCount - Elapsed;
+            }
+            else
+                BytesWritten = 0;
+
+            return (_LastError, BytesWritten);
+        }
+
+
+        public async Task<(int Error, int BytesRead)> DBReadAsync(int DBNumber, int Start, int Size, byte[] Buffer)
+		{
+            return await ReadAreaAsync(S7Area.DB, DBNumber, Start, Size, S7WordLength.Byte, Buffer);
+        }
+
+		public async Task<(int Error, int BytesRead)> DBWriteAsync(int DBNumber, int Start, int Size, byte[] Buffer)
+		{
+			return await WriteAreaAsync(S7Area.DB, DBNumber, Start, Size, S7WordLength.Byte, Buffer);
+		}
+
+		public async Task<(int Error, int BytesRead)> MBReadAsync(int Start, int Size, byte[] Buffer)
+		{
+			return await ReadAreaAsync(S7Area.MK, 0, Start, Size, S7WordLength.Byte, Buffer);
+		}
+
+		public async Task<(int Error, int BytesRead)> MBWriteAsync(int Start, int Size, byte[] Buffer)
+		{
+			return await WriteAreaAsync(S7Area.MK, 0, Start, Size, S7WordLength.Byte, Buffer);
+		}
+
+		public async Task<(int Error, int BytesRead)> EBReadAsync(int Start, int Size, byte[] Buffer)
+		{
+			return await ReadAreaAsync(S7Area.PE, 0, Start, Size, S7WordLength.Byte, Buffer);
+		}
+
+		public async Task<(int Error, int BytesRead)> EBWriteAsync(int Start, int Size, byte[] Buffer)
+		{
+			return await WriteAreaAsync(S7Area.PE, 0, Start, Size, S7WordLength.Byte, Buffer);
+		}
+
+		public async Task<(int Error, int BytesRead)> ABReadAsync(int Start, int Size, byte[] Buffer)
+		{
+			return await ReadAreaAsync(S7Area.PA, 0, Start, Size, S7WordLength.Byte, Buffer);
+		}
+
+		public async Task<(int Error, int BytesRead)> ABWriteAsync(int Start, int Size, byte[] Buffer)
+		{
+			return await WriteAreaAsync(S7Area.PA, 0, Start, Size, S7WordLength.Byte, Buffer);
+		}
+
+		public async Task<(int Error, int BytesRead)> TMReadAsync(int Start, int Amount, ushort[] Buffer)
+		{
+            byte[] sBuffer = new byte[Amount * 2];
+            var Result = await ReadAreaAsync(S7Area.TM, 0, Start, Amount, S7WordLength.Timer, sBuffer);
+            if (Result.Error == 0)
+            {
+                for (int c = 0; c < Amount; c++)
+                {
+                    Buffer[c] = (ushort)((sBuffer[c * 2 + 1] << 8) + (sBuffer[c * 2]));
+                }
+            }
+            return Result;
+		}
+
+		public async Task<(int Error, int BytesRead)> TMWriteAsync(int Start, int Amount, ushort[] Buffer)
+		{
+			byte[] sBuffer = new byte[Amount * 2];
+            for (int c = 0; c < Amount; c++)
+            {
+                sBuffer[c * 2] = (byte)(Buffer[c] & 0x00FF);
+                sBuffer[c * 2 + 1] = (byte)(Buffer[c] >> 8);
+            }
+            return await WriteAreaAsync(S7Area.TM, 0, Start, Amount, S7WordLength.Timer, sBuffer);
+		}
+
+		public async Task<(int Error, int BytesRead)> CTReadAsync(int Start, int Amount, ushort[] Buffer)
+		{
+            byte[] sBuffer = new byte[Amount * 2];
+            var Result = await ReadAreaAsync(S7Area.CT, 0, Start, Amount, S7WordLength.Counter, sBuffer);
+            if (Result.Error == 0)
+            {
+                for (int c = 0; c < Amount; c++)
+                {
+                    Buffer[c] = (ushort)((sBuffer[c * 2 + 1] << 8) + (sBuffer[c * 2]));
+                }
+            }
+            return Result;
+        }
+
+		public async Task<int> CTWriteAsync(int Start, int Amount, ushort[] Buffer)
+		{
+			byte[] sBuffer = new byte[Amount * 2];
+            for (int c = 0; c < Amount; c++)
+            {
+                sBuffer[c * 2] = (byte)(Buffer[c] & 0x00FF);
+                sBuffer[c * 2 + 1] = (byte)(Buffer[c] >> 8);
+            }
+            return (await WriteAreaAsync(S7Area.CT, 0, Start, Amount, S7WordLength.Counter, sBuffer)).Error;
+		}
+
+		public int ListBlocksOfTypeAsync(int BlockType, ushort[] List)
 		{
 			return S7Consts.errCliFunctionNotImplemented;
 		}
 
-		public int AsWriteArea(int Area, int DBNumber, int Start, int Amount, int WordLen, byte[] Buffer)
+        public async Task<(int Error, S7SZL SZL, int Size)> ReadSZLAsync(int ID, int Index, S7SZL SZL, int Size)
+        {
+            int Length;
+            int DataSZL;
+            int Offset = 0;
+            bool Done = false;
+            bool First = true;
+            byte Seq_in = 0x00;
+            ushort Seq_out = 0x0000;
+
+            _LastError = 0;
+            Time_ms = 0;
+            int Elapsed = Environment.TickCount;
+            SZL.Header.LENTHDR = 0;
+
+            do
+            {
+                if (First)
+                {
+                    S7_SZL_FIRST.SetWordAt(11, ++Seq_out);
+                    S7_SZL_FIRST.SetWordAt(29, (ushort)ID);
+                    S7_SZL_FIRST.SetWordAt(31, (ushort)Index);
+                    await SendPacketAsync(S7_SZL_FIRST);
+                }
+                else
+                {
+                    S7_SZL_NEXT.SetWordAt(11, ++Seq_out);
+                    S7_SZL_NEXT[24] = (byte)Seq_in;
+                    await SendPacketAsync(S7_SZL_NEXT);
+                }
+                if (_LastError != 0)
+                    return (_LastError, SZL, Size);
+
+                Length = await RecvIsoPacketAsync();
+                if (_LastError == 0)
+                {
+                    if (First)
+                    {
+                        if (Length > 32) // the minimum expected
+                        {
+                            if ((PDU.GetWordAt(27) == 0) && (PDU[29] == (byte)0xFF))
+                            {
+                                // Gets Amount of this slice
+                                DataSZL = PDU.GetWordAt(31) - 8; // Skips extra params (ID, Index ...)
+                                Done = PDU[26] == 0x00;
+                                Seq_in = (byte)PDU[24]; // Slice sequence
+                                SZL.Header.LENTHDR = PDU.GetWordAt(37);
+                                SZL.Header.N_DR = PDU.GetWordAt(39);
+                                Array.Copy(PDU, 41, SZL.Data, Offset, DataSZL);
+                                Offset += DataSZL;
+                                SZL.Header.LENTHDR += SZL.Header.LENTHDR;
+                            }
+                            else
+                                _LastError = S7Consts.errCliInvalidPlcAnswer;
+                        }
+                        else
+                            _LastError = S7Consts.errIsoInvalidPDU;
+                    }
+                    else
+                    {
+                        if (Length > 32) // the minimum expected
+                        {
+                            if ((PDU.GetWordAt(27) == 0) && (PDU[29] == (byte)0xFF))
+                            {
+                                // Gets Amount of this slice
+                                DataSZL = PDU.GetWordAt(31);
+                                Done = PDU[26] == 0x00;
+                                Seq_in = (byte)PDU[24]; // Slice sequence
+                                Array.Copy(PDU, 37, SZL.Data, Offset, DataSZL);
+                                Offset += DataSZL;
+                                SZL.Header.LENTHDR += SZL.Header.LENTHDR;
+                            }
+                            else
+                                _LastError = S7Consts.errCliInvalidPlcAnswer;
+                        }
+                        else
+                            _LastError = S7Consts.errIsoInvalidPDU;
+                    }
+                }
+                First = false;
+            }
+            while (!Done && (_LastError == 0));
+
+            if (_LastError == 0)
+            {
+                Size = SZL.Header.LENTHDR;
+                Time_ms = Environment.TickCount - Elapsed;
+            }
+
+            return (_LastError, SZL, Size);
+        }
+
+
+        public (S7SZLList? List, Int32 ItemsCount) ReadSZLListAsync(S7SZLList List, Int32 ItemsCount)
+		{
+            throw new NotImplementedException();
+        }
+
+		public int UploadAsync(int BlockType, int BlockNum, byte[] UsrData, ref int Size)
 		{
 			return S7Consts.errCliFunctionNotImplemented;
 		}
 
-		public int AsDBRead(int DBNumber, int Start, int Size, byte[] Buffer)
+		public int FullUploadAsync(int BlockType, int BlockNum, byte[] UsrData, ref int Size)
 		{
 			return S7Consts.errCliFunctionNotImplemented;
 		}
 
-		public int AsDBWrite(int DBNumber, int Start, int Size, byte[] Buffer)
-		{
-			return S7Consts.errCliFunctionNotImplemented;
-		}
-
-		public int AsMBRead(int Start, int Size, byte[] Buffer)
-		{
-			return S7Consts.errCliFunctionNotImplemented;
-		}
-
-		public int AsMBWrite(int Start, int Size, byte[] Buffer)
-		{
-			return S7Consts.errCliFunctionNotImplemented;
-		}
-
-		public int AsEBRead(int Start, int Size, byte[] Buffer)
-		{
-			return S7Consts.errCliFunctionNotImplemented;
-		}
-
-		public int AsEBWrite(int Start, int Size, byte[] Buffer)
-		{
-			return S7Consts.errCliFunctionNotImplemented;
-		}
-
-		public int AsABRead(int Start, int Size, byte[] Buffer)
-		{
-			return S7Consts.errCliFunctionNotImplemented;
-		}
-
-		public int AsABWrite(int Start, int Size, byte[] Buffer)
-		{
-			return S7Consts.errCliFunctionNotImplemented;
-		}
-
-		public int AsTMRead(int Start, int Amount, ushort[] Buffer)
-		{
-			return S7Consts.errCliFunctionNotImplemented;
-		}
-
-		public int AsTMWrite(int Start, int Amount, ushort[] Buffer)
-		{
-			return S7Consts.errCliFunctionNotImplemented;
-		}
-
-		public int AsCTRead(int Start, int Amount, ushort[] Buffer)
-		{
-			return S7Consts.errCliFunctionNotImplemented;
-		}
-
-		public int AsCTWrite(int Start, int Amount, ushort[] Buffer)
-		{
-			return S7Consts.errCliFunctionNotImplemented;
-		}
-
-		public int AsListBlocksOfType(int BlockType, ushort[] List)
-		{
-			return S7Consts.errCliFunctionNotImplemented;
-		}
-
-		public int AsReadSZL(int ID, int Index, ref S7SZL Data, ref Int32 Size)
-		{
-			return S7Consts.errCliFunctionNotImplemented;
-		}
-
-		public int AsReadSZLList(ref S7SZLList List, ref Int32 ItemsCount)
-		{
-			return S7Consts.errCliFunctionNotImplemented;
-		}
-
-		public int AsUpload(int BlockType, int BlockNum, byte[] UsrData, ref int Size)
-		{
-			return S7Consts.errCliFunctionNotImplemented;
-		}
-
-		public int AsFullUpload(int BlockType, int BlockNum, byte[] UsrData, ref int Size)
-		{
-			return S7Consts.errCliFunctionNotImplemented;
-		}
-
-		public int ASDownload(int BlockNum, byte[] UsrData, int Size)
+		public int DownloadAsync(int BlockNum, byte[] UsrData, int Size)
 		{
 			return S7Consts.errCliFunctionNotImplemented;
 		}
@@ -2165,12 +2984,66 @@ namespace Sharp7
 			return S7Consts.errCliFunctionNotImplemented;
 		}
 
-		public int AsDBFill(int DBNumber, int FillChar)
+        public async Task<(int Error, int Size)> DBGetAsync(int DBNumber, byte[] UsrData, int Size)
+        {
+            S7BlockInfo BI = new S7BlockInfo();
+            int Elapsed = Environment.TickCount;
+            Time_ms = 0;
+
+			var agResult = await GetAgBlockInfoAsync(Block_DB, DBNumber, BI);
+            _LastError = agResult.Error;
+
+            if (_LastError == 0)
+            {
+                int DBSize = BI.MC7Size;
+                if (DBSize <= UsrData.Length)
+                {
+                    Size = DBSize;
+                    var result = await DBReadAsync(DBNumber, 0, DBSize, UsrData);
+					_LastError = result.Error;
+                    if (_LastError == 0)
+                        Size = DBSize;
+                }
+                else
+                {
+                    _LastError = S7Consts.errCliBufferTooSmall;
+                }
+            }
+            if (_LastError == 0)
+                Time_ms = Environment.TickCount - Elapsed;
+            return (_LastError, Size);
+        }
+
+
+        public int AsDBFill(int DBNumber, int FillChar)
 		{
 			return S7Consts.errCliFunctionNotImplemented;
 		}
 
-		public bool CheckAsCompletion(ref int opResult)
+        public async Task<int> DBFillAsync(int DBNumber, int FillChar)
+        {
+            S7BlockInfo BI = new S7BlockInfo();
+            int Elapsed = Environment.TickCount;
+            Time_ms = 0;
+
+			var agResult = await GetAgBlockInfoAsync(Block_DB, DBNumber, BI);
+            _LastError = agResult.Error;
+
+            if (_LastError == 0)
+            {
+                byte[] Buffer = new byte[BI.MC7Size];
+                for (int c = 0; c < BI.MC7Size; c++)
+                    Buffer[c] = (byte)FillChar;
+                var result = await DBWriteAsync(DBNumber, 0, BI.MC7Size, Buffer);
+				_LastError = result.Error;
+            }
+            if (_LastError == 0)
+                Time_ms = Environment.TickCount - Elapsed;
+            return _LastError;
+        }
+
+
+        public bool CheckAsCompletion(ref int opResult)
 		{
 			opResult = 0;
 			return false;

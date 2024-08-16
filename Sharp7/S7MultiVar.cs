@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 
 namespace Sharp7
 {
@@ -121,7 +122,38 @@ namespace Sharp7
 			return GlobalResult;
 		}
 
-		public int Write()
+        public async Task<int> ReadAsync()
+        {
+            int FunctionResult;
+            int GlobalResult;
+            try
+            {
+                if (Count > 0)
+                {
+                    FunctionResult = await FClient.ReadMultiVarsAsync(Items, Count);
+                    if (FunctionResult == 0)
+                    {
+                        for (int c = 0; c < S7Client.MaxVars; c++)
+                        {
+                            Results[c] = Items[c].Result;
+                        }
+                    }
+                    GlobalResult = FunctionResult;
+                }
+                else
+                {
+                    GlobalResult = S7Consts.errCliFunctionRefused;
+                }
+            }
+            finally
+            {
+                Clear(); // handles are no more needed and MUST be freed
+            }
+            return GlobalResult;
+        }
+
+
+        public int Write()
 		{
 			int FunctionResult;
 			int GlobalResult;
@@ -145,7 +177,38 @@ namespace Sharp7
 			return GlobalResult;
 		}
 
-		public void Clear()
+        public async Task<int> WriteAsync()
+        {
+            int FunctionResult;
+            int GlobalResult;
+            try
+            {
+                if (Count > 0)
+                {
+                    FunctionResult = await FClient.WriteMultiVarsAsync(Items, Count);
+                    if (FunctionResult == 0)
+                    {
+                        for (int c = 0; c < S7Client.MaxVars; c++)
+                        {
+                            Results[c] = Items[c].Result;
+                        }
+                    }
+                    GlobalResult = FunctionResult;
+                }
+                else
+                {
+                    GlobalResult = S7Consts.errCliFunctionRefused;
+                }
+            }
+            finally
+            {
+                Clear(); // handles are no more needed and MUST be freed
+            }
+            return GlobalResult;
+        }
+
+
+        public void Clear()
 		{
 			for (int c = 0; c < Count; c++)
 			{

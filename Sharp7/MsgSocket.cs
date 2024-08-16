@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Threading;
 using System.Net.Sockets;
+using System.Threading.Tasks;
 
 namespace Sharp7
 {
@@ -12,6 +13,7 @@ namespace Sharp7
         private int _WriteTimeout = 2000;
         private int _ConnectTimeout = 1000;
         private int LastError;
+        private SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
         public MsgSocket()
         {
         }
@@ -158,6 +160,157 @@ namespace Sharp7
                 Close();
             }
             return LastError;
+        }
+
+        private async Task TCPPingAsync(string Host, int Port)
+        {
+            LastError = 0;
+            using (Socket PingSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp))
+            {
+                try
+                {
+                    var connectTask = PingSocket.ConnectAsync(Host, Port);
+                    if (await Task.WhenAny(connectTask, Task.Delay(_ConnectTimeout)) != connectTask)
+                    {
+                        LastError = S7Consts.errTCPConnectionFailed;
+                    }
+                }
+                catch
+                {
+                    LastError = S7Consts.errTCPConnectionFailed;
+                }
+            }
+        }
+
+        public async Task<int> ConnectAsync(string Host, int Port)
+        {
+            await _semaphore.WaitAsync();
+            try
+            {
+                LastError = 0;
+                if (!Connected)
+                {
+                    await TCPPingAsync(Host, Port);
+                    if (LastError == 0)
+                    {
+                        try
+                        {
+                            CreateSocket();
+                            await TCPSocket.ConnectAsync(Host, Port);
+                        }
+                        catch
+                        {
+                            LastError = S7Consts.errTCPConnectionFailed;
+                        }
+                    }
+                }
+                return LastError;
+            }
+            finally
+            {
+                _semaphore.Release();
+            }
+        }
+
+        private async Task<int> WaitForDataAsync(int Size, int Timeout)
+        {
+            await _semaphore.WaitAsync();
+            try
+            {
+                bool Expired = false;
+                int SizeAvail;
+                int Elapsed = Environment.TickCount;
+                LastError = 0;
+                try
+                {
+                    SizeAvail = TCPSocket.Available;
+                    while ((SizeAvail < Size) && (!Expired))
+                    {
+                        await Task.Delay(2);
+                        SizeAvail = TCPSocket.Available;
+                        Expired = Environment.TickCount - Elapsed > Timeout;
+                        if (Expired && (SizeAvail > 0))
+                        {
+                            try
+                            {
+                                byte[] Flush = new byte[SizeAvail];
+                                await TCPSocket.ReceiveAsync(new ArraySegment<byte>(Flush), SocketFlags.None);
+                            }
+                            catch
+                            {
+                                LastError = S7Consts.errTCPDataReceive;
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                    LastError = S7Consts.errTCPDataReceive;
+                }
+                if (Expired)
+                {
+                    LastError = S7Consts.errTCPDataReceive;
+                }
+                return LastError;
+            }
+            finally
+            {
+                _semaphore.Release();
+            }
+        }
+
+        public async Task<int> ReceiveAsync(byte[] Buffer, int Start, int Size)
+        {
+            await _semaphore.WaitAsync();
+            try
+            {
+                int BytesRead = 0;
+                LastError = await WaitForDataAsync(Size, _ReadTimeout);
+                if (LastError == 0)
+                {
+                    try
+                    {
+                        BytesRead = await TCPSocket.ReceiveAsync(new ArraySegment<byte>(Buffer, Start, Size), SocketFlags.None);
+                    }
+                    catch
+                    {
+                        LastError = S7Consts.errTCPDataReceive;
+                    }
+                    if (BytesRead == 0)
+                    {
+                        LastError = S7Consts.errTCPDataReceive;
+                        Close();
+                    }
+                }
+                return LastError;
+            }
+            finally
+            {
+                _semaphore.Release();
+            }
+        }
+
+        public async Task<int> SendAsync(byte[] Buffer, int Size)
+        {
+            await _semaphore.WaitAsync();
+            try
+            {
+                LastError = 0;
+                try
+                {
+                    await TCPSocket.SendAsync(new ArraySegment<byte>(Buffer, 0, Size), SocketFlags.None);
+                }
+                catch
+                {
+                    LastError = S7Consts.errTCPDataSend;
+                    Close();
+                }
+                return LastError;
+            }
+            finally
+            {
+                _semaphore.Release();
+            }
         }
 
         public bool Connected => (TCPSocket != null) && (TCPSocket.Connected);

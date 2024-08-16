@@ -1,5 +1,13 @@
 ﻿namespace Sharp7
 {
+    /// <summary>
+    /// PE = Digital In,
+    /// PA = Digital Out,
+    /// MK = Memory,
+    /// DB = Data Block,
+    /// CT = Counter,
+    /// TM = Timer
+    /// </summary>
     public enum S7Area
     {
         PE = 0x81,
