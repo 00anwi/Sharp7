@@ -32,6 +32,19 @@ namespace Sharp7
             }
         }
 
+        public async Task CloseAsync()
+        {
+            await _semaphore.WaitAsync();
+            try
+            {
+                Close();
+            }
+            finally
+            {
+                _semaphore.Release();
+            }
+        }
+
         private void CreateSocket()
         {
             TCPSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
@@ -67,18 +80,18 @@ namespace Sharp7
         {
             LastError = 0;
             if (!Connected)
-            { 
+            {
                 TCPPing(Host, Port);
                 if (LastError == 0)
-                try
-                {
+                    try
+                    {
                         CreateSocket();
                         TCPSocket.Connect(Host, Port);
-                }
-                catch
-                {
+                    }
+                    catch
+                    {
                         LastError = S7Consts.errTCPConnectionFailed;
-                }
+                    }
             }
             return LastError;
         }
@@ -214,49 +227,41 @@ namespace Sharp7
 
         private async Task<int> WaitForDataAsync(int Size, int Timeout)
         {
-            await _semaphore.WaitAsync();
+            bool Expired = false;
+            int SizeAvail;
+            int Elapsed = Environment.TickCount;
+            LastError = 0;
             try
             {
-                bool Expired = false;
-                int SizeAvail;
-                int Elapsed = Environment.TickCount;
-                LastError = 0;
-                try
+                SizeAvail = TCPSocket.Available;
+                while ((SizeAvail < Size) && (!Expired))
                 {
+                    await Task.Delay(2);
                     SizeAvail = TCPSocket.Available;
-                    while ((SizeAvail < Size) && (!Expired))
+                    Expired = Environment.TickCount - Elapsed > Timeout;
+                    if (Expired && (SizeAvail > 0))
                     {
-                        await Task.Delay(2);
-                        SizeAvail = TCPSocket.Available;
-                        Expired = Environment.TickCount - Elapsed > Timeout;
-                        if (Expired && (SizeAvail > 0))
+                        try
                         {
-                            try
-                            {
-                                byte[] Flush = new byte[SizeAvail];
-                                await TCPSocket.ReceiveAsync(new ArraySegment<byte>(Flush), SocketFlags.None);
-                            }
-                            catch
-                            {
-                                LastError = S7Consts.errTCPDataReceive;
-                            }
+                            byte[] Flush = new byte[SizeAvail];
+                            await TCPSocket.ReceiveAsync(new ArraySegment<byte>(Flush), SocketFlags.None);
+                        }
+                        catch
+                        {
+                            LastError = S7Consts.errTCPDataReceive;
                         }
                     }
                 }
-                catch
-                {
-                    LastError = S7Consts.errTCPDataReceive;
-                }
-                if (Expired)
-                {
-                    LastError = S7Consts.errTCPDataReceive;
-                }
-                return LastError;
             }
-            finally
+            catch
             {
-                _semaphore.Release();
+                LastError = S7Consts.errTCPDataReceive;
             }
+            if (Expired)
+            {
+                LastError = S7Consts.errTCPDataReceive;
+            }
+            return LastError;
         }
 
         public async Task<int> ReceiveAsync(byte[] Buffer, int Start, int Size)
@@ -331,5 +336,5 @@ namespace Sharp7
             get => _ConnectTimeout;
             set => _ConnectTimeout = value;
         }
-    }   
+    }
 }

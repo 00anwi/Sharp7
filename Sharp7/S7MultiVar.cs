@@ -63,6 +63,18 @@ namespace Sharp7
 			return Add(Tag.Area, Tag.WordLen, Tag.DBNumber, Tag.Start, Tag.Elements, ref Buffer);
 		}
 
+		public bool Add<T>(VariableAddress variableAddress, ref T[] buffer)
+		{
+			return Add(new S7Consts.S7Tag()
+            {
+                Area = (int)variableAddress.Operand,
+                WordLen = (int)variableAddress.Type,
+                DBNumber = variableAddress.DbNo,
+                Start = variableAddress.Start,
+                Elements = variableAddress.Length
+            }, ref buffer);
+		}
+
 		public bool Add<T>(Int32 Area, Int32 WordLen, Int32 DBNumber, Int32 Start, Int32 Amount, ref T[] Buffer)
 		{
 			return Add(Area, WordLen, DBNumber, Start, Amount, ref Buffer, 0);

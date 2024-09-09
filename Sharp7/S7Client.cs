@@ -902,7 +902,12 @@ namespace Sharp7
 			return 0;
 		}
 
-		public int GetParam(Int32 ParamNumber, ref int Value)
+        public async Task DisconnectAsync()
+        {
+            await Socket?.CloseAsync();
+        }
+
+        public int GetParam(Int32 ParamNumber, ref int Value)
 		{
 			int Result = 0;
 			switch (ParamNumber)
@@ -1721,22 +1726,22 @@ namespace Sharp7
 
 		public int EBRead(int Start, int Size, byte[] Buffer)
 		{
-			return ReadArea(S7Area.PE, 0, Start, Size, S7WordLength.Byte, Buffer);
+			return ReadArea(S7Area.DI, 0, Start, Size, S7WordLength.Byte, Buffer);
 		}
 
 		public int EBWrite(int Start, int Size, byte[] Buffer)
 		{
-			return WriteArea(S7Area.PE, 0, Start, Size, S7WordLength.Byte, Buffer);
+			return WriteArea(S7Area.DI, 0, Start, Size, S7WordLength.Byte, Buffer);
 		}
 
 		public int ABRead(int Start, int Size, byte[] Buffer)
 		{
-			return ReadArea(S7Area.PA, 0, Start, Size, S7WordLength.Byte, Buffer);
+			return ReadArea(S7Area.DQ, 0, Start, Size, S7WordLength.Byte, Buffer);
 		}
 
 		public int ABWrite(int Start, int Size, byte[] Buffer)
 		{
-			return WriteArea(S7Area.PA, 0, Start, Size, S7WordLength.Byte, Buffer);
+			return WriteArea(S7Area.DQ, 0, Start, Size, S7WordLength.Byte, Buffer);
 		}
 
 		public int TMRead(int Start, int Amount, ushort[] Buffer)
@@ -2783,22 +2788,22 @@ namespace Sharp7
 
 		public async Task<(int Error, int BytesRead)> EBReadAsync(int Start, int Size, byte[] Buffer)
 		{
-			return await ReadAreaAsync(S7Area.PE, 0, Start, Size, S7WordLength.Byte, Buffer);
+			return await ReadAreaAsync(S7Area.DI, 0, Start, Size, S7WordLength.Byte, Buffer);
 		}
 
 		public async Task<(int Error, int BytesRead)> EBWriteAsync(int Start, int Size, byte[] Buffer)
 		{
-			return await WriteAreaAsync(S7Area.PE, 0, Start, Size, S7WordLength.Byte, Buffer);
+			return await WriteAreaAsync(S7Area.DI, 0, Start, Size, S7WordLength.Byte, Buffer);
 		}
 
 		public async Task<(int Error, int BytesRead)> ABReadAsync(int Start, int Size, byte[] Buffer)
 		{
-			return await ReadAreaAsync(S7Area.PA, 0, Start, Size, S7WordLength.Byte, Buffer);
+			return await ReadAreaAsync(S7Area.DQ, 0, Start, Size, S7WordLength.Byte, Buffer);
 		}
 
 		public async Task<(int Error, int BytesRead)> ABWriteAsync(int Start, int Size, byte[] Buffer)
 		{
-			return await WriteAreaAsync(S7Area.PA, 0, Start, Size, S7WordLength.Byte, Buffer);
+			return await WriteAreaAsync(S7Area.DQ, 0, Start, Size, S7WordLength.Byte, Buffer);
 		}
 
 		public async Task<(int Error, int BytesRead)> TMReadAsync(int Start, int Amount, ushort[] Buffer)
